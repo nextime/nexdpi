@@ -1,0 +1,45 @@
+{
+  "Cats":{
+
+     "SocialNetwork":{
+        "nostart": ["DNS", "ICMP", "IGMP", "DHCP", "DHCPv6", "IGMP", "LLMNR", "ICMP", "ICMPv6", "LLMNR", "MDNS", "NetBIOS", "WSD"], 
+        "noapps": "TikTok", 
+        "knownapps": ["Reddit", "Instagram", "Reddit", "Twitter"], 
+        "ipset": "social_triplet", 
+        "timeout":"3600"
+     },
+
+     "Network":{
+        "nostart": [], 
+        "noapps": [], 
+        "knownapps": ["DHCP", "DHCPV6", "DNScrypt", "DoH_DoT", "DNS", "Ookla", "ICMP", "ICMPV6", "IGMP", "LLMNR", "MDNS", "DoH_DoT", "Ookla", "WSD"], 
+        "ipset": "system_triplet", 
+        "timeout":"3600"
+     },
+
+     "Game":{
+        "nostart": [], 
+        "noapps": [], 
+        "knownapps": ["Steam", "Xbox", "Playstation"], 
+        "ipset": "streaming_triplet", 
+        "timeout":"3600"
+     },
+
+     "Template-GroupName":{
+        "nostart": ["DNS", "ICMP"], 
+        "noapps": [], 
+        "knownapps": [], 
+        "ipset": "name_ipset", 
+        "timeout":"3600"
+     }
+  },
+
+  "Apps":{
+     "TikTok":{
+        "ipset": "kids_triplet", 
+        "nostart": [], 
+        "timeout": "3600", 
+        "knowstarts":"TLS"
+     }
+  } 
+}

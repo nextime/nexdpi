@@ -54,12 +54,12 @@ templconf = """
 """
 
 try:
-   fconf = open("/etc/nexdpi/dpirules.conf", "r")
+   fconf = open("/etc/nexdpi/dpirules.json", "r")
    R=json.loads(fconf.read())
    fconf.close()
 except:
    print(" Cant start without a rules file.\n\n")
-   print(" Please use the following example to create a JSON config file as /etc/nexdpi/dpirules.conf\n\n")
+   print(" Please use the following example to create a JSON config file as /etc/nexdpi/dpirules.json\n\n")
    print(templconf)
    sys.exit(0)
 
