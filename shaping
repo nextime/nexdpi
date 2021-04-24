@@ -1,0 +1,324 @@
+#!/bin/bash -x
+
+declare -A SHAPEMAPDOWN
+declare -A SHAPEMAPUP
+declare -A IPSETS
+UPDEV="eth0"
+#DOWNDEV="ifb0" 
+#DOWNDEV="dummy1"
+#DOWNDEV="eth1"
+DOWNDEV="br0"
+IP="/sbin/ip"
+TC="/sbin/tc"
+IPSET="/usr/sbin/ipset"
+IPT="/usr/sbin/iptables"
+IP6T="/usr/sbin/ip6tables"
+FORCEIFB=false
+DEFBAND="980"
+DOUPLOAD=true
+DODOWNLOAD=true
+IPSET_DURATION=3600 # Seconds
+IPSETS_NAMES="social kids system full streaming"
+NAT=true
+MARKSTART=5
+
+for IPS in $IPSETS_NAMES ; do
+   IPSETS[$IPS]=$MARKSTART
+   ((MARKSTART=MARKSTART+1))
+done
+
+IPTMARK="$IPT -A PREROUTING -t mangle"
+IPTCHECK="$IPT -C PREROUTING -t mangle"
+IPTDEL="$IPT -D PREROUTING -t mangle"
+
+IP6TMARK="$IP6T -A PREROUTING -t mangle"
+IP6TCHECK="$IP6T -C PREROUTING -t mangle"
+IP6TDEL="$IP6T -D PREROUTING -t mangle"
+
+
+
+iptmark() {
+   $IPTCHECK $* >/dev/null 2>&1 || $IPTMARK $*
+}
+
+iptdel() {
+   $IPTCHECK $* >/dev/null 2>&1 && $IPTDEL $* || true
+}
+
+ip6mark() {
+   $IP6TCHECK $* >/dev/null 2>&1 || $IP6TMARK $*
+}
+
+ip6del() {
+   $IP6TCHECK $* >/dev/null 2>&1 && $IP6TDEL $* || true
+}
+
+if [ "$DOWNDEV" == "ifb0" ] ; then
+   FORCEIFB=true
+fi
+
+if [ x"$(brctl show | grep $DOWNDEV)" != "" ] ; then
+   DOWNDEV=$(ls /sys/class/net/br0/brif/)
+fi
+
+# NOTE: Express in mbit, a bit less than the actual connections helps
+#       ours qdisc to be in charge when full.
+#       For 1Gbps for example uses 980
+
+for DEV in $UPDEV ; do
+   SHAPEMAPUP[$DEV]=$DEFBAND
+done
+for DEV in $DOWNDEV ; do
+   SHAPEMAPDOWN[$DEV]=$DEFBAND
+done
+
+
+if [ x"$1" == x"off" ] ; then
+
+   for DEV in $DOWNDEV ; do
+      $TC qdisc del dev $DEV root > /dev/null 2>&1 || true
+      if $FORCEIFB  ; then 
+         $IP link set dev $DEV down
+      fi
+   done
+   for DEV in $UPDEV ; do
+      $TC qdisc del dev $DEV root > /dev/null 2>&1 || true
+      $TC qdisc del dev $DEV ingress > /dev/null 2>&1 || true
+   done
+   exit 0
+else
+   for IPS in $IPSETS_NAMES ; do
+
+      $IPSET create ${IPS}_triplet hash:ip,port,ip family inet timeout $IPSET_DURATION > /dev/null 2>&1 || true
+      $IPSET create ${IPS}_ip hash:ip family inet > /dev/null 2>&1 || true
+      $IPSET create ${IPS}_extip hash:ip family inet > /dev/null 2>&1 || true
+
+      $IPSET create ${IPS}_triplet6 hash:ip,port,ip family inet6 timeout $IPSET_DURATION > /dev/null 2>&1 || true
+      $IPSET create ${IPS}_ip6 hash:ip family inet6 > /dev/null 2>&1 || true
+      $IPSET create ${IPS}_extip6 hash:ip family inet6 > /dev/null 2>&1 || true
+
+   done
+fi
+
+
+# Setting up virtual mirror interface for downloads
+# XXX Works only with 1 ifb device!
+#
+# XXX ifb has AWFUL performances. 
+#     Don't use it if you want to achieve anything more than 600Mbps.
+if $FORCEIFB ; then
+   if [ "$DOWNDEV" == "ifb0" ] ; then
+      modprobe ifb
+   fi
+   $IP link set dev $DOWNDEV up
+
+   # Redirect incoming packet from WAN to the virtual interface
+   $TC qdisc add dev $UPDEV handle ffff: ingress
+   # Filter to make the packet going on virtual interface
+   $TC filter add dev $UPDEV protocol ip parent ffff: u32 match u32 0 0 action mirred egress redirect dev $DOWNDEV
+fi
+
+
+#
+# Shaping scheme
+#
+#  .-------------------------------------------------------------------------------------------------------.
+#  |                                                                                                       |
+#  |  HTB Base 1:                                                                                          |
+#  | .---------------------------------------------------------------------------------------------------. |
+#  | |                                                                                                   | |
+#  | |  Class 1:1                                                                                        | |
+#  | | .------------------------------------------------------------. .---------------..---------------. | |
+#  | | |                                                            | |               ||               | | |
+#  | | |  Class 1:10                                                | |  Class 1:20   ||  Class 1:30   | | |
+#  | | | .--------------------------------------------------------. | | .-----------. || .-----------. | | |
+#  | | | |                                                        | | | |           | || |           | | | |
+#  | | | | HTB 11:                                                | | | | fq_codel  | || | fq_codel  | | | |              
+#  | | | | .----------------..----------------..----------------. | | | |           | || |           | | | |
+#  | | | | |                ||                ||                | | | | '-----------' || '-----------' | | |
+#  | | | | |  Class 11:10   ||  Class 11:12   ||  Class 11:16   | | | '---------------''---------------' | |
+#  | | | | | .------------. || .------------. || .------------. | | | .---------------..---------------. | |
+#  | | | | | |            | || |            | || |            | | | | |               ||               | | |
+#  | | | | | |  fq_codel  | || |  fq_codel  | || |  fq_codel  | | | | | Class 1:40    || Class 1:50    | | |
+#  | | | | | |            | || |            | || |            | | | | | .-----------. || .-----------. | | |
+#  | | | | | '------------' || '------------' || '------------' | | | | |           | || |           | | | |
+#  | | | | |                ||                ||                | | | | |  fq_codel | || | fq_codel  | | | |
+#  | | | | '----------------''----------------''----------------' | | | |           | || |           | | | |
+#  | | | '--------------------------------------------------------' | | '-----------' || '-----------' | | |
+#  | | '------------------------------------------------------------' '---------------''---------------' | |
+#  | '---------------------------------------------------------------------------------------------------' |
+#  '-------------------------------------------------------------------------------------------------------'
+#
+# HTB Base 1: Main bucket, HTB qdisc on root, 950Mbit/1Gbit
+#  '-Class 1:1 Main container class
+#    |
+#    |- Class 1:10 Default class for catchall all packets not for other classes
+#    |   '-HTB 11: qdisc for catchall class
+#    |      |
+#    |      |-Class 11:10 normal priority packets
+#    |      |  '- fq_codel
+#    |      |  
+#    |      |-Class 11:12 high priority packets (also streaming)
+#    |      |  '- fq_codel
+#    |      |
+#    |      '-Class 11:16 low priority packets
+#    |         '- fq_codel
+#    |  
+#    |-Class 1:20: system/infrastructure
+#    |  '- fq_codel
+#    |
+#    |-Class 1:30: Kiddos
+#    |  '- fq_codel
+#    |
+#    |-Class 1:40: SocialNetworks and similar
+#    |  '- fq_codel
+#    |
+#    '-Class 1:50: work
+#       '- fq_codel
+#
+#exit 0
+
+ApplyShaping() {
+   SHAPEDEV=$1
+   local TCLASS="/sbin/tc class add dev $SHAPEDEV parent"
+   local TDISC="/sbin/tc qdisc add dev $SHAPEDEV parent"
+	local TFILTER="/sbin/tc filter add dev $SHAPEDEV parent"
+   REALRATE=$2
+   DIRECTION=$3
+   local REDUCERATE=$(($REALRATE/30))
+   local MAXREDUCEDRATE=$(($REALRATE-$REDUCERATE))
+   local HALFRATE=$(($REALRATE/2))
+   local MINRATE=$(($REALRATE/10))
+   local FAIRRATE=$(($REALRATE/3))
+
+   [ x"$DIRECTION" == x"up" ] && INTDIR="src" || INTDIR="dst"
+   [ x"$DIRECTION" == x"up" ] && OUTDIR="dst" || OUTDIR="src"
+
+
+   # Check if we have to reset the interface to default
+   /sbin/tc qdisc del dev $SHAPEDEV root > /dev/null 2>&1 || true 
+   
+   # Change root qdisc
+   /sbin/tc qdisc replace dev $SHAPEDEV root handle 1: htb default 10
+
+   # Create base class
+   $TCLASS 1: classid 1:1 htb rate ${REALRATE}mbit
+   
+      # Container qdisk and class for cathall 
+      $TCLASS 1:1 classid 1:10 htb rate ${MAXREDUCEDRATE}mbit ceil ${REALRATE}mbit prio 1
+         $TDISC 1:10 handle 11: htb default 10
+            $TCLASS 11: classid 11:1 htb rate ${MAXREDUCEDRATE}mbit ceil ${REALRATE}mbit
+
+               # Catchall normal priority
+               $TCLASS 11:1 classid 11:10 htb rate ${MAXREDUCEDRATE}mbit ceil ${REALRATE}mbit prio 2
+               	$TDISC 11:10 fq_codel
+   
+               # Catchall low priority
+               $TCLASS 11:1 classid 11:12 htb rate ${FAIRRATE}mbit ceil ${REALRATE}mbit prio 3 
+						$TDISC 11:12 fq_codel
+
+               # Catchall high priority
+					$TCLASS 11:1 classid 11:16 htb rate ${MINRATE}mbit ceil ${FAIRRATE}mbit prio 1
+						$TDISC 11:16 fq_codel
+
+			   # Classificy and filter based on priority in the packet
+			   $TFILTER 11: handle 0x1337 flow map key priority baseclass 11:10			
+
+      # System/infrastructure
+      $TCLASS 1:1 classid 1:20 htb rate ${MINRATE}mbit ceil ${REALRATE}mbit prio 2
+         $TDISC 1:20 fq_codel
+
+      # Kiddos
+      $TCLASS 1:1 classid 1:30 htb rate ${FAIRRATE}mbit ceil ${HALFRATE}mbit prio 2
+         $TDISC 1:30 fq_codel
+
+
+		# SocialNetworks
+		$TCLASS 1:1 classid 1:40 htb rate ${MINRATE}mbit ceil ${FAIRRATE}mbit prio 3
+			$TDISC 1:40 fq_codel
+
+      # Work / Full Speed
+      $TCLASS 1:1 classid 1:50 htb rate ${MAXREDUCEDRATE}mbit ceil ${REALRATE}mbit prio 1
+         $TDISC 1:50 fq_codel
+
+      $TFILTER 1: protocol ip prio 4 basic match "ipset(social_extip $OUTDIR)" flowid 1:40
+      $TFILTER 1: protocol ip prio 3 basic match "ipset(social_ip $INTDIR)" flowid 1:40
+      $TFILTER 1: protocol ip prio 2 basic match "ipset(social_triplet $OUTDIR,$OUTDIR,$INTDIR)" flowid 1:40
+      $TFILTER 1: protocol ip prio 1 handle ${IPSETS["social"]} fw flowid 1:40
+      $TFILTER 1: protocol ipv6 prio 8 basic match "ipset(social_extip6 $OUTDIR)" flowid 1:40
+      $TFILTER 1: protocol ipv6 prio 7 basic match "ipset(social_ip6 $INTDIR)" flowid 1:40
+      $TFILTER 1: protocol ipv6 prio 6 basic match "ipset(social_triplet6 $OUTDIR,$OUTDIR,$INTDIR)" flowid 1:40
+      $TFILTER 1: protocol ipv6 prio 5 handle ${IPSETS["social"]} fw flowid 1:40
+
+      $TFILTER 1: protocol ip prio 4 basic match "ipset(kids_extip $OUTDIR)" flowid 1:43
+      $TFILTER 1: protocol ip prio 3 basic match "ipset(kids_ip $INTDIR)" flowid 1:30
+      $TFILTER 1: protocol ip prio 2 basic match "ipset(kids_triplet $OUTDIR,$OUTDIR,$INTDIR)" flowid 1:30
+      $TFILTER 1: protocol ip prio 1 handle ${IPSETS["kids"]} fw flowid 1:30
+      $TFILTER 1: protocol ipv6 prio 8 basic match "ipset(kids_extip6 $OUTDIR)" flowid 1:43
+      $TFILTER 1: protocol ipv6 prio 7 basic match "ipset(kids_ip6 $INTDIR)" flowid 1:30
+      $TFILTER 1: protocol ipv6 prio 6 basic match "ipset(kids_triplet6 $OUTDIR,$OUTDIR,$INTDIR)" flowid 1:30
+      $TFILTER 1: protocol ipv6 prio 5 handle ${IPSETS["kids"]} fw flowid 1:30
+
+      $TFILTER 1: protocol ip prio 4 basic match "ipset(system_extip $OUTDIR)" flowid 1:20
+      $TFILTER 1: protocol ip prio 3 basic match "ipset(system_ip $INTDIR)" flowid 1:20
+      $TFILTER 1: protocol ip prio 2 basic match "ipset(system_triplet $OUTDIR,$OUTDIR,$INTDIR)" flowid 1:20
+      $TFILTER 1: protocol ip prio 1 handle ${IPSETS["system"]} fw flowid 1:20
+      $TFILTER 1: protocol ipv6 prio 8 basic match "ipset(system_extip6 $OUTDIR)" flowid 1:20
+      $TFILTER 1: protocol ipv6 prio 7 basic match "ipset(system_ip6 $INTDIR)" flowid 1:20
+      $TFILTER 1: protocol ipv6 prio 6 basic match "ipset(system_triplet6 $OUTDIR,$OUTDIR,$INTDIR)" flowid 1:20
+      $TFILTER 1: protocol ipv6 prio 5 handle ${IPSETS["system"]} fw flowid 1:20
+
+      $TFILTER 1: protocol ip prio 4 basic match "ipset(full_extip $OUTDIR)" flowid 1:50
+      $TFILTER 1: protocol ip prio 3 basic match "ipset(full_ip $INTDIR)" flowid 1:50
+      $TFILTER 1: protocol ip prio 2 basic match "ipset(full_triplet $OUTDIR,$OUTDIR,$INTDIR)" flowid 1:50
+      $TFILTER 1: protocol ip prio 1 handle ${IPSETS["full"]} fw flowid 1:50
+      $TFILTER 1: protocol ipv6 prio 8 basic match "ipset(full_extip6 $OUTDIR)" flowid 1:50
+      $TFILTER 1: protocol ipv6 prio 7 basic match "ipset(full_ip6 $INTDIR)" flowid 1:50
+      $TFILTER 1: protocol ipv6 prio 6 basic match "ipset(full_triplet6 $OUTDIR,$OUTDIR,$INTDIR)" flowid 1:50
+      $TFILTER 1: protocol ipv6 prio 5 handle ${IPSETS["full"]} fw flowid 1:50
+
+      $TFILTER 1: protocol ip prio 4 basic match "ipset(streaming_extip $OUTDIR)" flowid 11:12
+      $TFILTER 1: protocol ip prio 3 basic match "ipset(streaming_ip $INTDIR)" flowid 11:12
+      $TFILTER 1: protocol ip prio 2 basic match "ipset(streaming_triplet $OUTDIR,$OUTDIR,$INTDIR)" flowid 11:12
+      $TFILTER 1: protocol ip prio 1 handle ${IPSETS["streaming"]} fw flowid 11:12
+      $TFILTER 1: protocol ipv6 prio 8 basic match "ipset(streaming_extip6 $OUTDIR)" flowid 11:12
+      $TFILTER 1: protocol ipv6 prio 7 basic match "ipset(streaming_ip6 $INTDIR)" flowid 11:12
+      $TFILTER 1: protocol ipv6 prio 6 basic match "ipset(streaming_triplet6 $OUTDIR,$OUTDIR,$INTDIR)" flowid 11:12
+      $TFILTER 1: protocol ipv6 prio 5 handle ${IPSETS["streaming"]} fw flowid 11:12
+
+
+      if [ x"$DIRECTION" == x"up" ] ; then
+         if $NAT ; then
+            for IPS in $IPSETS_NAMES ; do
+
+               iptmark -m set --match-set ${IPS}_ip $INTDIR -j MARK --set-mark ${IPSETS[$IPS]}
+               iptmark -m set --match-set ${IPS}_triplet $OUTDIR,$OUTDIR,$INTDIR -j MARK --set-mark ${IPSETS[$IPS]}
+               iptmark -m set --match-set ${IPS}_extip $OUTDIR -j MARK --set-mark ${IPSETS[$IPS]}
+
+               ip6mark -m set --match-set ${IPS}_ip6 $INTDIR -j MARK --set-mark ${IPSETS[$IPS]}
+               ip6mark -m set --match-set ${IPS}_triplet6 $OUTDIR,$OUTDIR,$INTDIR -j MARK --set-mark ${IPSETS[$IPS]}
+               ip6mark -m set --match-set ${IPS}_extip6 $OUTDIR -j MARK --set-mark ${IPSETS[$IPS]}
+
+            done
+         fi
+      fi
+
+}
+
+
+if $DODOWNLOAD ; then
+	for SHAPEDEV in "${!SHAPEMAPDOWN[@]}" ; do
+      REALRATE=${SHAPEMAPDOWN[$SHAPEDEV]}
+   	ApplyShaping $SHAPEDEV $REALRATE down
+	done
+fi
+
+if $DOUPLOAD ; then
+   for SHAPEDEV in "${!SHAPEMAPUP[@]}" ; do
+      REALRATE=${SHAPEMAPUP[$SHAPEDEV]}
+      ApplyShaping $SHAPEDEV $REALRATE up
+   done
+fi
+
+
+
