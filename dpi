@@ -4,7 +4,7 @@ from setproctitle import setproctitle
 from shell_cmd import sh
 from nfstream import NFStreamer
 import time
-import sys
+import sys, signal
 import json
 
 deftimeout="3600"
@@ -63,6 +63,28 @@ except:
    print(templconf)
    sys.exit(0)
 
+
+Cats = R['Cats']
+Apps = R['Apps']
+
+
+def reloadconf(signum, frame):
+   global Cats
+   global Apps
+
+   try:
+      fconf = open("/etc/nexdpi/dpirules.json", "r")
+      R=json.loads(fconf.read())
+      fconf.close()
+      Cats = R['Cats']
+      Apps = R['Apps']
+      print("Rules file reloaded")
+   except:
+      print("Error loading rules file.")
+
+
+
+signal.signal(signal.SIGHUP, reloadconf)
 
 Cats = R['Cats']
 Apps = R['Apps']
